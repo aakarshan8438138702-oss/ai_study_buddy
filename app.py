@@ -2,19 +2,14 @@ import json
 import random
 import re
 import uuid
-from pathlib import Path
 
 import streamlit as st
 
 st.set_page_config(page_title="Study Buddy", page_icon="📚", layout="wide")
 
 # ---------------------------------------------------------------------------
-# Files and data helpers
+# Data helpers
 # ---------------------------------------------------------------------------
-BASE_DIR = Path(__file__).parent
-NOTES_FILE = BASE_DIR / "notes.json"
-CARDS_FILE = BASE_DIR / "flashcards.json"
-
 NOTE_FIELDS = ("title", "content")
 CARD_FIELDS = ("question", "answer")
 
@@ -47,52 +42,36 @@ def clean_items(raw, fields):
     return items, changed
 
 
-def read_json(path):
-    try:
-        if path.exists():
-            return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        pass
-    return []
-
-
-def write_json(path, items):
-    try:
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(
-            json.dumps(items, indent=2, ensure_ascii=False), encoding="utf-8"
-        )
-        tmp.replace(path)
-        return True
-    except OSError:
-        st.error("Could not save to disk. Use the backup download on the Dashboard.")
-        return False
-
-
 def find_by_id(items, item_id):
     return next((i for i in items if i["id"] == item_id), None)
-
-
-def save_notes():
-    write_json(NOTES_FILE, st.session_state.notes)
-
-
-def save_cards():
-    write_json(CARDS_FILE, st.session_state.cards)
 
 
 # ---------------------------------------------------------------------------
 # Session state (loaded once per browser session)
 # ---------------------------------------------------------------------------
+DEMO_NOTES = [
+    {
+        "title": "Ohm's Law",
+        "content": "Voltage equals current multiplied by resistance. Resistance is measured in ohms. Current is the flow of electric charge through a conductor. Power equals voltage multiplied by current.",
+    },
+    {
+        "title": "Kirchhoff's Laws",
+        "content": "Kirchhoff's current law says the total current entering a junction equals the total current leaving it. Kirchhoff's voltage law says the sum of voltages around a closed loop is zero. These laws are used for analysing complex circuits.",
+    },
+]
+DEMO_CARDS = [
+    {"question": "What is the unit of resistance?", "answer": "Ohm"},
+    {"question": "What is the unit of current?", "answer": "Ampere"},
+    {"question": "What does KVL stand for?", "answer": "Kirchhoff's Voltage Law"},
+    {"question": "What is the formula for power?", "answer": "P = VI"},
+]
+
+# st.session_state is private to each visitor's browser session, so every
+# visitor starts with their own copy of the demo data and cannot see or
+# change anyone else's notes.
 if "notes" not in st.session_state:
-    notes_data, notes_fixed = clean_items(read_json(NOTES_FILE), NOTE_FIELDS)
-    cards_data, cards_fixed = clean_items(read_json(CARDS_FILE), CARD_FIELDS)
-    st.session_state.notes = notes_data
-    st.session_state.cards = cards_data
-    if notes_fixed:
-        save_notes()
-    if cards_fixed:
-        save_cards()
+    st.session_state.notes = [dict(n, id=uuid.uuid4().hex) for n in DEMO_NOTES]
+    st.session_state.cards = [dict(c, id=uuid.uuid4().hex) for c in DEMO_CARDS]
 
 defaults = {
     "edit_note_id": None,
@@ -120,6 +99,7 @@ st.sidebar.divider()
 st.sidebar.metric("Total notes", len(notes))
 st.sidebar.metric("Total flashcards", len(cards))
 st.sidebar.caption("Built with Python + Streamlit")
+st.sidebar.caption("🔒 Your data is private to this session")
 
 
 # ---------------------------------------------------------------------------
@@ -173,6 +153,7 @@ def build_card_quiz(card_list, how_many=5):
 # ---------------------------------------------------------------------------
 if page == "🏠 Dashboard":
     st.subheader("Welcome back, learner! 👋")
+    st.caption("🔒 Your notes and flashcards are private to you in this session.")
 
     a, b, c = st.columns(3)
     a.metric("Total notes", len(notes))
@@ -193,10 +174,11 @@ if page == "🏠 Dashboard":
                 st.write(note["content"][:250])
 
     st.divider()
-    with st.expander("💾 Backup & restore (important on Streamlit Cloud)"):
+    with st.expander("💾 Save & restore your data"):
         st.caption(
-            "Streamlit Cloud can erase files saved by the app when it restarts, "
-            "sleeps or redeploys. Download a backup regularly."
+            "Your notes and flashcards are private and only live in this browser "
+            "session. Refreshing or closing the tab clears them, so download a "
+            "backup to keep them and restore it next time."
         )
         d1, d2 = st.columns(2)
         d1.download_button(
@@ -225,10 +207,8 @@ if page == "🏠 Dashboard":
                 items, _ = clean_items(raw, fields)
                 if kind == "Notes":
                     st.session_state.notes = items
-                    save_notes()
                 else:
                     st.session_state.cards = items
-                    save_cards()
                 st.session_state.quiz = None
                 st.success(f"Restored {len(items)} item(s).")
                 st.rerun()
@@ -270,7 +250,6 @@ elif page == "📝 My Notes":
             edit_note["title"] = title.strip()
             edit_note["content"] = content.strip()
             st.session_state.edit_note_id = None
-            save_notes()
             st.rerun()
         else:
             notes.append(
@@ -280,7 +259,6 @@ elif page == "📝 My Notes":
                     "content": content.strip(),
                 }
             )
-            save_notes()
             st.rerun()
 
     if edit_note:
@@ -313,7 +291,6 @@ elif page == "📝 My Notes":
                     ]
                     if st.session_state.edit_note_id == note["id"]:
                         st.session_state.edit_note_id = None
-                    save_notes()
                     st.rerun()
 
 
@@ -341,7 +318,6 @@ elif page == "📚 Flashcards":
                         "answer": answer.strip(),
                     }
                 )
-                save_cards()
                 st.rerun()
 
         st.divider()
@@ -356,7 +332,6 @@ elif page == "📚 Flashcards":
                         c for c in cards if c["id"] != card["id"]
                     ]
                     st.session_state.card_revealed = False
-                    save_cards()
                     st.rerun()
 
     with study_tab:
