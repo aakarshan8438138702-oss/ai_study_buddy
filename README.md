@@ -3,7 +3,7 @@
 
 A beginner-friendly study app built with Python and Streamlit. Save notes, make flashcards and test yourself with quizzes.
 
-🔗 **Live app:** [YOUR APP LINK]
+🔗 **Live app:** https://aistudybuddy-yb3cfe2kzfvh4fqddujwju.streamlit.app/
 
 ## Features
 - 📝 **Notes:** create, search, edit and delete
