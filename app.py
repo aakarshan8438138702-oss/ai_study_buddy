@@ -148,7 +148,7 @@ elif page == "📝 My Notes":
 
                 x, y = st.columns(2)
 
-                if x.button("✏️ Edit", key="edit_" + note["id"]):
+                if x.button("✏️ Edit", key="edit_" + note.get("id", str(i))):
                     st.session_state.edit_id = note["id"]
                     st.rerun()
 
