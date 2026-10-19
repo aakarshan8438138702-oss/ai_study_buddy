@@ -1,141 +1,298 @@
-
 import json
-from pathlib import Path
 import random
+import re
+import uuid
+from pathlib import Path
+
 import streamlit as st
 
-st.set_page_config(
-    page_title="AI Study Buddy",
-    page_icon="📚",
-    layout="wide"
-)
+st.set_page_config(page_title="Study Buddy", page_icon="📚", layout="wide")
 
-FILE = Path("notes.json")
+# ---------------------------------------------------------------------------
+# Files and data helpers
+# ---------------------------------------------------------------------------
+BASE_DIR = Path(__file__).parent
+NOTES_FILE = BASE_DIR / "notes.json"
+CARDS_FILE = BASE_DIR / "flashcards.json"
+
+NOTE_FIELDS = ("title", "content")
+CARD_FIELDS = ("question", "answer")
 
 
-def load_notes():
+def clean_items(raw, fields):
+    """Make any loaded data safe: every item gets text fields and a unique id.
+
+    This is the real fix for the missing "id" error. Old items without an id
+    (or with duplicate ids) are repaired once, here, when the data is loaded.
+    Returns (items, changed) where changed means something was repaired.
+    """
+    if not isinstance(raw, list):
+        return [], True
+    items, seen, changed = [], set(), False
+    for entry in raw:
+        if not isinstance(entry, dict):
+            changed = True
+            continue
+        item = {f: str(entry.get(f, "")).strip() for f in fields}
+        if not all(item.values()):
+            changed = True  # skip incomplete entries
+            continue
+        item_id = str(entry.get("id", "")).strip()
+        if not item_id or item_id in seen:
+            item_id = uuid.uuid4().hex
+            changed = True
+        seen.add(item_id)
+        item["id"] = item_id
+        items.append(item)
+    return items, changed
+
+
+def read_json(path):
     try:
-        if FILE.exists():
-            data = json.loads(FILE.read_text(encoding="utf-8"))
-            return data if isinstance(data, list) else []
+        if path.exists():
+            return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         pass
     return []
 
 
-def save_notes(notes):
-    FILE.write_text(
-        json.dumps(notes, indent=2, ensure_ascii=False),
-        encoding="utf-8"
-    )
+def write_json(path, items):
+    try:
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(
+            json.dumps(items, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        tmp.replace(path)
+        return True
+    except OSError:
+        st.error("Could not save to disk. Use the backup download on the Dashboard.")
+        return False
 
 
+def find_by_id(items, item_id):
+    return next((i for i in items if i["id"] == item_id), None)
+
+
+def save_notes():
+    write_json(NOTES_FILE, st.session_state.notes)
+
+
+def save_cards():
+    write_json(CARDS_FILE, st.session_state.cards)
+
+
+# ---------------------------------------------------------------------------
+# Session state (loaded once per browser session)
+# ---------------------------------------------------------------------------
 if "notes" not in st.session_state:
-    st.session_state.notes = load_notes()
+    notes_data, notes_fixed = clean_items(read_json(NOTES_FILE), NOTE_FIELDS)
+    cards_data, cards_fixed = clean_items(read_json(CARDS_FILE), CARD_FIELDS)
+    st.session_state.notes = notes_data
+    st.session_state.cards = cards_data
+    if notes_fixed:
+        save_notes()
+    if cards_fixed:
+        save_cards()
 
-if "edit_id" not in st.session_state:
-    st.session_state.edit_id = None
+defaults = {
+    "edit_note_id": None,
+    "card_pos": 0,
+    "card_revealed": False,
+    "quiz": None,
+}
+for key, value in defaults.items():
+    st.session_state.setdefault(key, value)
 
 notes = st.session_state.notes
+cards = st.session_state.cards
 
-st.title("📚 AI Study Buddy")
+# ---------------------------------------------------------------------------
+# Layout: title + sidebar
+# ---------------------------------------------------------------------------
+st.title("📚 Study Buddy")
 st.caption("Your personal workspace for smarter studying.")
 
 page = st.sidebar.radio(
     "Navigate",
-    ["🏠 Dashboard", "📝 My Notes", "🃏 Flashcards", "🧠 Quiz"]
+    ["🏠 Dashboard", "📝 My Notes", "📚 Flashcards", "🧠 Quiz"],
 )
-
 st.sidebar.divider()
 st.sidebar.metric("Total notes", len(notes))
+st.sidebar.metric("Total flashcards", len(cards))
 st.sidebar.caption("Built with Python + Streamlit")
 
 
-def persist():
-    save_notes(st.session_state.notes)
+# ---------------------------------------------------------------------------
+# Quiz generators (plain Python, no AI model)
+# ---------------------------------------------------------------------------
+def split_sentences(text):
+    parts = re.split(r"(?<=[.!?])\s+|\n+", text)
+    return [p.strip() for p in parts if len(p.split()) >= 5]
 
 
+def build_note_quiz(note, how_many=5):
+    """Fill-in-the-blank questions made from the sentences of one note."""
+    sentences = split_sentences(note["content"])
+    words = sorted({w.lower() for w in re.findall(r"[A-Za-z]{5,}", note["content"])})
+    if not sentences or len(words) < 4:
+        return []
+    random.shuffle(sentences)
+    questions = []
+    for sentence in sentences:
+        candidates = re.findall(r"[A-Za-z]{5,}", sentence)
+        if not candidates:
+            continue
+        answer = random.choice(candidates)
+        blanked = re.sub(rf"\b{re.escape(answer)}\b", "_____", sentence, count=1)
+        correct = answer.lower()
+        options = [correct] + random.sample([w for w in words if w != correct], 3)
+        random.shuffle(options)
+        questions.append({"question": blanked, "options": options, "answer": correct})
+        if len(questions) == how_many:
+            break
+    return questions
+
+
+def build_card_quiz(card_list, how_many=5):
+    """Multiple-choice questions: pick the right answer for each flashcard."""
+    questions = []
+    for card in random.sample(card_list, min(how_many, len(card_list))):
+        others = list({c["answer"] for c in card_list if c["answer"] != card["answer"]})
+        if not others:
+            continue
+        options = [card["answer"]] + random.sample(others, min(3, len(others)))
+        random.shuffle(options)
+        questions.append(
+            {"question": card["question"], "options": options, "answer": card["answer"]}
+        )
+    return questions
+
+
+# ---------------------------------------------------------------------------
+# Dashboard
+# ---------------------------------------------------------------------------
 if page == "🏠 Dashboard":
     st.subheader("Welcome back, learner! 👋")
 
     a, b, c = st.columns(3)
     a.metric("Total notes", len(notes))
-    b.metric("Words saved", sum(
-        len(n.get("content", "").split()) for n in notes
-    ))
-    c.metric("Study tools", 3)
+    b.metric("Total flashcards", len(cards))
+    c.metric("Words saved", sum(len(n["content"].split()) for n in notes))
 
     st.divider()
-    st.subheader("Quick start")
-
+    st.subheader("What you can do")
     st.write("📝 **My Notes:** Create, search, edit and delete notes.")
-    st.write("🃏 **Flashcards:** Revise your saved material.")
-    st.write("🧠 **Quiz:** Test yourself using your notes.")
+    st.write("📚 **Flashcards:** Make question/answer cards and reveal answers.")
+    st.write("🧠 **Quiz:** Test yourself with quizzes built from your notes or cards.")
 
     if notes:
-        st.subheader("Recently added")
+        st.subheader("Recently added notes")
         for note in notes[-3:][::-1]:
             with st.container(border=True):
                 st.markdown(f"**{note['title']}**")
                 st.write(note["content"][:250])
 
+    st.divider()
+    with st.expander("💾 Backup & restore (important on Streamlit Cloud)"):
+        st.caption(
+            "Streamlit Cloud can erase files saved by the app when it restarts, "
+            "sleeps or redeploys. Download a backup regularly."
+        )
+        d1, d2 = st.columns(2)
+        d1.download_button(
+            "⬇️ Download notes.json",
+            json.dumps(notes, indent=2, ensure_ascii=False),
+            file_name="notes.json",
+            mime="application/json",
+        )
+        d2.download_button(
+            "⬇️ Download flashcards.json",
+            json.dumps(cards, indent=2, ensure_ascii=False),
+            file_name="flashcards.json",
+            mime="application/json",
+        )
 
+        st.markdown("**Restore from a backup** (this replaces your current data)")
+        kind = st.radio("The file contains", ["Notes", "Flashcards"], horizontal=True)
+        upload = st.file_uploader("Choose a .json backup", type="json")
+        if upload is not None and st.button("Restore now"):
+            try:
+                raw = json.load(upload)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                st.error("That file is not valid JSON.")
+            else:
+                fields = NOTE_FIELDS if kind == "Notes" else CARD_FIELDS
+                items, _ = clean_items(raw, fields)
+                if kind == "Notes":
+                    st.session_state.notes = items
+                    save_notes()
+                else:
+                    st.session_state.cards = items
+                    save_cards()
+                st.session_state.quiz = None
+                st.success(f"Restored {len(items)} item(s).")
+                st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# My Notes
+# ---------------------------------------------------------------------------
 elif page == "📝 My Notes":
     st.subheader("📝 Your study notes")
 
-    query = st.text_input("🔍 Search notes by title or content")
+    query = st.text_input("🔍 Search notes by title or content").strip().lower()
 
-    edit_note = next(
-        (n for n in notes if n.get("id") == st.session_state.edit_id),
-        None
-    )
+    edit_note = find_by_id(notes, st.session_state.edit_note_id)
+    if edit_note is None:
+        st.session_state.edit_note_id = None
+    form_key = edit_note["id"] if edit_note else "new"
 
     with st.form("note_form", clear_on_submit=True):
         title = st.text_input(
             "Note title",
-            value=edit_note["title"] if edit_note else ""
+            value=edit_note["title"] if edit_note else "",
+            key=f"note_title_{form_key}",
         )
         content = st.text_area(
             "Your notes",
             value=edit_note["content"] if edit_note else "",
-            height=180
+            height=180,
+            key=f"note_content_{form_key}",
         )
-        save = st.form_submit_button(
-            "💾 Update note" if edit_note else "💾 Save note",
-            use_container_width=True
+        submitted = st.form_submit_button(
+            "💾 Update note" if edit_note else "💾 Save note"
         )
 
-    if save:
+    if submitted:
         if not title.strip() or not content.strip():
             st.warning("Enter both a title and some notes.")
         elif edit_note:
             edit_note["title"] = title.strip()
             edit_note["content"] = content.strip()
-            st.session_state.edit_id = None
-            persist()
-            st.success("Note updated!")
+            st.session_state.edit_note_id = None
+            save_notes()
             st.rerun()
         else:
-            notes.append({
-                "id": str(random.getrandbits(64)),
-                "title": title.strip(),
-                "content": content.strip()
-            })
-            persist()
-            st.success("Note saved!")
+            notes.append(
+                {
+                    "id": uuid.uuid4().hex,
+                    "title": title.strip(),
+                    "content": content.strip(),
+                }
+            )
+            save_notes()
             st.rerun()
 
-    if edit_note and st.button("Cancel editing"):
-        st.session_state.edit_id = None
-        st.rerun()
+    if edit_note:
+        st.info(f"Editing: {edit_note['title']}")
+        if st.button("Cancel editing"):
+            st.session_state.edit_note_id = None
+            st.rerun()
 
     st.divider()
 
     filtered = [
-        n for n in notes
-        if query.lower() in (
-            n.get("title", "") + " " + n.get("content", "")
-        ).lower()
+        n for n in notes if query in (n["title"] + " " + n["content"]).lower()
     ]
 
     if not filtered:
@@ -146,162 +303,186 @@ elif page == "📝 My Notes":
                 st.markdown(f"### {note['title']}")
                 st.write(note["content"])
 
-                x, y = st.columns(2)
-
-                if x.button("✏️ Edit", key="edit_" + str(note.get("id", note.get("title", "note")))):
-                    st.session_state.edit_id = note["id"]
+                col_edit, col_delete = st.columns(2)
+                if col_edit.button("✏️ Edit", key=f"edit_{note['id']}"):
+                    st.session_state.edit_note_id = note["id"]
                     st.rerun()
-
-                if y.button("🗑️ Delete", key="del_" + note["id"]):
+                if col_delete.button("🗑️ Delete", key=f"del_{note['id']}"):
                     st.session_state.notes = [
                         n for n in notes if n["id"] != note["id"]
                     ]
-                    if st.session_state.edit_id == note["id"]:
-                        st.session_state.edit_id = None
-                    persist()
+                    if st.session_state.edit_note_id == note["id"]:
+                        st.session_state.edit_note_id = None
+                    save_notes()
                     st.rerun()
 
 
-elif page == "🃏 Flashcards":
-    st.subheader("🃏 Flashcard revision")
+# ---------------------------------------------------------------------------
+# Flashcards
+# ---------------------------------------------------------------------------
+elif page == "📚 Flashcards":
+    st.subheader("📚 Flashcards")
+    study_tab, manage_tab = st.tabs(["Study", "Add / manage cards"])
 
-    if not notes:
-        st.info("Create some notes first!")
-    else:
-        selected = st.selectbox(
-            "Choose study material",
-            notes,
-            format_func=lambda n: n["title"]
-        )
+    with manage_tab:
+        with st.form("card_form", clear_on_submit=True):
+            question = st.text_input("Question")
+            answer = st.text_area("Answer", height=100)
+            add_card = st.form_submit_button("➕ Add flashcard")
 
-        sentences = [
-            s.strip()
-            for s in selected["content"].replace("\n", ".").split(".")
-            if s.strip()
-        ]
+        if add_card:
+            if not question.strip() or not answer.strip():
+                st.warning("Enter both a question and an answer.")
+            else:
+                cards.append(
+                    {
+                        "id": uuid.uuid4().hex,
+                        "question": question.strip(),
+                        "answer": answer.strip(),
+                    }
+                )
+                save_cards()
+                st.rerun()
 
-        if sentences:
-            if "card_index" not in st.session_state:
-                st.session_state.card_index = 0
+        st.divider()
+        if not cards:
+            st.info("No flashcards yet. Add your first one above!")
+        for card in cards:
+            with st.container(border=True):
+                st.markdown(f"**Q:** {card['question']}")
+                st.write(f"**A:** {card['answer']}")
+                if st.button("🗑️ Delete", key=f"delcard_{card['id']}"):
+                    st.session_state.cards = [
+                        c for c in cards if c["id"] != card["id"]
+                    ]
+                    st.session_state.card_revealed = False
+                    save_cards()
+                    st.rerun()
 
-            idx = st.session_state.card_index % len(sentences)
-
-            st.caption(
-                f"Card {idx + 1} of {len(sentences)}"
-            )
+    with study_tab:
+        if not cards:
+            st.info("Add some flashcards in the 'Add / manage cards' tab first.")
+        else:
+            pos = st.session_state.card_pos % len(cards)
+            card = cards[pos]
+            st.caption(f"Card {pos + 1} of {len(cards)}")
 
             with st.container(border=True):
-                st.markdown("### 📖 Study point")
-                st.write(sentences[idx])
+                st.markdown("### ❓ Question")
+                st.write(card["question"])
+                if st.session_state.card_revealed:
+                    st.markdown("### ✅ Answer")
+                    st.write(card["answer"])
 
-            left, right = st.columns(2)
-
-            if left.button("⬅️ Previous", use_container_width=True):
-                st.session_state.card_index = (
-                    idx - 1
-                ) % len(sentences)
+            c1, c2, c3, c4 = st.columns(4)
+            if c1.button("⬅️ Previous"):
+                st.session_state.card_pos = (pos - 1) % len(cards)
+                st.session_state.card_revealed = False
+                st.rerun()
+            if c2.button(
+                "🙈 Hide answer" if st.session_state.card_revealed else "👀 Show answer"
+            ):
+                st.session_state.card_revealed = not st.session_state.card_revealed
+                st.rerun()
+            if c3.button("🔀 Random"):
+                st.session_state.card_pos = random.randrange(len(cards))
+                st.session_state.card_revealed = False
+                st.rerun()
+            if c4.button("Next ➡️"):
+                st.session_state.card_pos = (pos + 1) % len(cards)
+                st.session_state.card_revealed = False
                 st.rerun()
 
-            if right.button("Next ➡️", use_container_width=True):
-                st.session_state.card_index = (
-                    idx + 1
-                ) % len(sentences)
-                st.rerun()
 
-            st.caption(
-                "These cards use sentences from your notes."
-            )
-        else:
-            st.info("Add more text to your selected note.")
-
-
+# ---------------------------------------------------------------------------
+# Quiz
+# ---------------------------------------------------------------------------
 elif page == "🧠 Quiz":
     st.subheader("🧠 Test your knowledge")
 
-    if not notes:
-        st.info("Create study notes before starting a quiz.")
-    else:
-        selected = st.selectbox(
-            "Choose a topic",
-            notes,
-            format_func=lambda n: n["title"],
-            key="quiz_topic"
+    source = st.radio(
+        "Make a quiz from",
+        ["📝 A note (fill in the blank)", "📚 My flashcards (pick the answer)"],
+        horizontal=True,
+    )
+
+    selected_note = None
+    if source.startswith("📝"):
+        if not notes:
+            st.info("Create a note first, then come back for a quiz.")
+            st.stop()
+        selected_note = st.selectbox(
+            "Choose a note", notes, format_func=lambda n: n["title"]
         )
+        source_key = "note:" + selected_note["id"]
+    else:
+        if len(cards) < 2:
+            st.info("Add at least two flashcards to make a quiz.")
+            st.stop()
+        source_key = "cards"
 
-        sentences = [
-            s.strip()
-            for s in selected["content"].replace("\n", ".").split(".")
-            if len(s.strip().split()) >= 3
-        ]
-
-        if len(sentences) < 2:
-            st.info(
-                "Add at least two sentences of study material "
-                "to create a quiz."
-            )
+    if st.button("🔄 Generate new quiz"):
+        if selected_note:
+            questions = build_note_quiz(selected_note)
         else:
-            if st.button("🔄 Generate new quiz"):
-                st.session_state.quiz_questions = random.sample(
-                    sentences, min(5, len(sentences))
-                )
-                st.session_state.quiz_answers = {}
-
-            if (
-                "quiz_questions" not in st.session_state
-                or st.session_state.get("quiz_topic_id")
-                != selected["id"]
-            ):
-                st.session_state.quiz_questions = random.sample(
-                    sentences, min(5, len(sentences))
-                )
-                st.session_state.quiz_answers = {}
-                st.session_state.quiz_topic_id = selected["id"]
-
-            questions = st.session_state.quiz_questions
-            score = 0
-
-            for i, answer in enumerate(questions):
-                options = list(dict.fromkeys(
-                    [answer] + random.sample(
-                        [s for s in sentences if s != answer],
-                        min(3, len(sentences) - 1)
-                    )
-                ))
-                random.shuffle(options)
-
-                st.markdown(f"**Question {i + 1}: Which statement appeared in your notes?**")
-
-                choice = st.radio(
-                    f"Select an answer for question {i + 1}",
-                    options,
-                    key=f"q_{selected['id']}_{i}",
-                    label_visibility="collapsed"
-                )
-
-                if st.button(
-                    "Check answer",
-                    key=f"check_{selected['id']}_{i}"
-                ):
-                    st.session_state.quiz_answers[str(i)] = (
-                        choice == answer
-                    )
-
-                if str(i) in st.session_state.quiz_answers:
-                    correct = st.session_state.quiz_answers[str(i)]
-                    if correct:
-                        st.success("Correct! 🎉")
-                    else:
-                        st.info(f"Review this statement: {answer}")
-
-                    if correct:
-                        score += 1
-
-                st.divider()
-
-            st.caption(
-                "This quiz tests recognition of your notes. "
-                "It does not yet use an AI model."
+            questions = build_card_quiz(cards)
+        if not questions:
+            st.warning(
+                "Not enough material. Notes need a few full sentences "
+                "(5+ words each) with some longer words."
             )
+            st.session_state.quiz = None
+        else:
+            st.session_state.quiz = {
+                "id": uuid.uuid4().hex,
+                "source": source_key,
+                "questions": questions,
+                "choices": None,
+            }
+
+    quiz = st.session_state.quiz
+    if quiz and quiz["source"] != source_key:
+        quiz = None  # the chosen source changed; ask for a fresh quiz
+
+    if not quiz:
+        st.info("Press **Generate new quiz** to begin.")
+    else:
+        with st.form(f"quiz_form_{quiz['id']}"):
+            picks = []
+            for i, q in enumerate(quiz["questions"]):
+                st.markdown(f"**Question {i + 1}:** {q['question']}")
+                picks.append(
+                    st.radio(
+                        f"Answer for question {i + 1}",
+                        q["options"],
+                        index=None,
+                        key=f"quiz_{quiz['id']}_{i}",
+                        label_visibility="collapsed",
+                    )
+                )
+                st.write("")
+            finished = st.form_submit_button("✅ Submit answers")
+
+        if finished:
+            quiz["choices"] = picks
+
+        if quiz["choices"] is not None:
+            score = 0
+            for q, pick in zip(quiz["questions"], quiz["choices"]):
+                if pick == q["answer"]:
+                    score += 1
+            total = len(quiz["questions"])
+            st.success(f"Your score: {score} / {total}")
+            for i, (q, pick) in enumerate(zip(quiz["questions"], quiz["choices"])):
+                if pick == q["answer"]:
+                    st.write(f"✅ Question {i + 1}: correct")
+                else:
+                    st.write(f"❌ Question {i + 1}: the answer was **{q['answer']}**")
+
+        st.caption(
+            "This quiz is generated with simple Python rules from your own "
+            "material. It does not use an AI model."
+        )
 
 st.sidebar.divider()
 st.sidebar.caption("Keep learning. Keep building. 🚀")
